@@ -151,25 +151,55 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         today = date.today()
-        due = df[df["next_due"].notna() & (df["next_due"] <= today)].copy()
 
-        if due.empty:
-            await update.message.reply_text(TEXT["status_none"])
+        # берём только те, у кого next_due есть
+        due_df = df[df["next_due"].notna()].copy()
+        if due_df.empty:
+            await update.message.reply_text("Пока нет данных по next_due.")
             return
 
-        due = due.sort_values(["next_due", "name"], ascending=[True, True])
+        # считаем разницу в днях: next_due - today
+        due_df["delta_days"] = due_df["next_due"].apply(lambda d: (d - today).days)
+
+        # показываем только ближайшие/просроченные
+        # хочешь — поменяй окно (например, <= 7)
+        view_df = due_df[due_df["delta_days"] <= 2].copy()
+
+        if view_df.empty:
+            # если ничего не горит, покажем ближайшие 3 по сроку
+            view_df = due_df.sort_values(["delta_days", "name"]).head(3)
+            header = "✅ Срочно ничего не нужно. Ближайшие:"
+        else:
+            header = "💧 Полив:"
+
+        view_df = view_df.sort_values(["delta_days", "name"])
 
         lines = []
-        for _, r in due.iterrows():
+        for _, r in view_df.iterrows():
             nm = str(r["name"])
-            loc = str(r["location"]) if "location" in due.columns and pd.notna(r.get("location")) else ""
-            suffix = f" ({loc})" if loc and loc != "nan" else ""
-            lines.append(f"- {nm}{suffix} — до {r['next_due']}")
+            loc = ""
+            if "location" in view_df.columns and pd.notna(r.get("location")):
+                loc = str(r["location"])
+            loc_part = f" ({loc})" if loc and loc != "nan" else ""
 
-        await update.message.reply_text(TEXT["status_head"] + "\n" + "\n".join(lines))
+            dd = int(r["delta_days"])
+            if dd < 0:
+                when = f"просрочено на {abs(dd)} дн."
+            elif dd == 0:
+                when = "сегодня"
+            elif dd == 1:
+                when = "завтра"
+            else:
+                when = f"через {dd} дн."
+
+            lines.append(f"- {nm}{loc_part} — {when} (до {r['next_due']})")
+
+        await update.message.reply_text(header + "\n" + "\n".join(lines))
+
     except Exception as e:
         await update.message.reply_text(TEXT["error"].format(e=e))
         raise
+
 
 
 async def water(update: Update, context: ContextTypes.DEFAULT_TYPE):
