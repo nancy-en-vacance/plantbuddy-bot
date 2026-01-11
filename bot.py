@@ -21,14 +21,20 @@ async def start(update, context: ContextTypes.DEFAULT_TYPE):
         "/water — mark watering"
     )
 
-async def status(update, context: ContextTypes.DEFAULT_TYPE):
-    df = load_plants()
-    today = datetime.now().date()
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # вся логика
+    except Exception as e:
+        await update.message.reply_text(
+            f"Error while reading plant data:\n{e}"
+        )
+        raise
 
-    if "next_due" in df.columns:
-        df["next_due"] = pd.to_datetime(df["next_due"], errors="coerce").dt.date
 
-    due = df[df["next_due"].notna() & (df["next_due"] <= today)]
+    if "next_due_if_suggested" in df.columns:
+        df["next_due_if_suggested"] = pd.to_datetime(df["next_due_if_suggested"], errors="coerce").dt.date
+
+    due = df[df["next_due_if_suggested"].notna() & (df["next_due_if_suggested"] <= today)]
 
     if due.empty:
         await update.message.reply_text("✅ Nothing to water today. Your plants are happy.")
