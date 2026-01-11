@@ -1,39 +1,75 @@
-#!/usr/bin/env python3
-# PlantBuddyCare_bot — Render Web Service + Telegram webhook
-# python-telegram-bot==20.7, pandas, openpyxl
-# ENV: TELEGRAM_TOKEN, BASE_URL (e.g. https://plantbuddy-bot.onrender.com), PORT (auto by Render), PLANTS_FILE (optional)
+# PlantBuddyCare_bot — Telegram plant care tracker (webhook + Render Web Service)
+# - Russian UI
+# - /water supports multi-select
+# - Normalizes column names
+# - Auto-generates next_due (last_watered + water_interval_days)
+# - /debug for diagnostics
+#
+# Env vars (Render -> Environment):
+#   TELEGRAM_TOKEN = BotFather token
+#   BASE_URL = https://<your-service>.onrender.com   (optional if Render gives RENDER_EXTERNAL_URL)
+# Optional:
+#   PORT = 10000  (Render provides PORT)
+#   PLANTS_FILE = plants.xlsx
 
 import os
 import re
 import sys
+import json
+import asyncio
 import logging
-from datetime import datetime, date, timedelta
-from zoneinfo import ZoneInfo
-from typing import Dict, List
+import threading
+from datetime import date, datetime, timedelta
+from typing import Dict, Tuple, Optional, List
 
 import pandas as pd
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-)
+from flask import Flask, request
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("plantbuddy")
 
-TZ = ZoneInfo(os.getenv("TZ", "Asia/Kolkata"))
-DATA_FILE = os.getenv("PLANTS_FILE", "plants.xlsx")
+PLANTS_FILE = os.getenv("PLANTS_FILE", "plants.xlsx")
+PORT = int(os.getenv("PORT", "10000"))
 
-CB_TOGGLE = "w_toggle:"  # w_toggle:<plant_id>
-CB_DONE = "w_done"
-CB_CANCEL = "w_cancel"
+# Render обычно даёт внешний URL в переменной RENDER_EXTERNAL_URL
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+BASE_URL = os.getenv("BASE_URL") or RENDER_EXTERNAL_URL
+
+WEBHOOK_PATH = "/webhook"
+HEALTH_PATH = "/"
+
+_file_lock = threading.Lock()
+
+ALIASES: Dict[str, str] = {
+    "plant_id": "plant_id",
+    "id": "plant_id",
+    "name": "name",
+    "name_raw": "name",
+    "plant_name": "name",
+    "plant_type": "plant_type",
+    "type": "plant_type",
+    "location": "location",
+    "last_watered": "last_watered",
+    "last_watered_date": "last_watered",
+    "last_watered_at": "last_watered",
+    "last_watered_d": "last_watered",
+    "water_interval_days": "water_interval_days",
+    "water_interval_day": "water_interval_days",
+    "water_interval": "water_interval_days",
+    "water_int": "water_interval_days",
+    "suggested_interval_days": "suggested_interval_days",
+    "suggested_interval": "suggested_interval_days",
+    "next_due": "next_due",
+    "next_due_if_suggested": "next_due",
+    "next_due_suggested": "next_due",
+    "pot_type": "pot_type",
+    "last_repot": "last_repot",
+    "repot_priority": "repot_priority",
+    "notes": "notes",
+}
 
 CANON_COLS = [
     "plant_id",
@@ -50,315 +86,297 @@ CANON_COLS = [
     "notes",
 ]
 
-ALIASES: Dict[str, str] = {
-    "plant_id": "plant_id",
-    "plantid": "plant_id",
-    "id": "plant_id",
 
-    "name": "name",
-    "name_raw": "name",
-    "plant_name": "name",
-
-    "plant_type": "plant_type",
-    "type": "plant_type",
-
-    "location": "location",
-    "room": "location",
-
-    "last_watered": "last_watered",
-    "last_watered_d": "last_watered",
-    "last_waterered": "last_watered",  # typo-safe
-
-    "water_interval_days": "water_interval_days",
-    "water_interval_day": "water_interval_days",
-    "water_interval": "water_interval_days",
-    "water_int": "water_interval_days",
-
-    "suggested_interval_days": "suggested_interval_days",
-    "suggested_interval_day": "suggested_interval_days",
-    "suggested_interval": "suggested_interval_days",
-
-    "next_due": "next_due",
-    "next_due_if_suggested": "next_due",
-    "next_due_suggested": "next_due",
-
-    "pot_type": "pot_type",
-    "last_repot": "last_repot",
-    "repot_priority": "repot_priority",
-    "notes": "notes",
-}
-
-def _today() -> date:
-    return datetime.now(TZ).date()
-
-def _norm_col(s: str) -> str:
-    s = str(s).strip().lower()
-    s = re.sub(r"\s+", "_", s)
-    s = re.sub(r"[^a-z0-9_]+", "_", s)
+def _slug(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^\w]+", "_", s, flags=re.UNICODE)
     s = re.sub(r"_+", "_", s).strip("_")
     return s
 
-def ensure_next_due(df: pd.DataFrame) -> pd.DataFrame:
-    # fill next_due if missing using last_watered + water_interval_days
-    mask = df["next_due"].isna() & df["last_watered"].notna() & df["water_interval_days"].notna()
-    if mask.any():
-        df.loc[mask, "next_due"] = [
-            (lw + timedelta(days=int(wi))) if isinstance(lw, date) and pd.notna(wi) else pd.NA
-            for lw, wi in zip(df.loc[mask, "last_watered"], df.loc[mask, "water_interval_days"])
-        ]
-    return df
 
-def load_df() -> pd.DataFrame:
-    if not os.path.exists(DATA_FILE):
-        raise FileNotFoundError(f"Не найден файл данных: {DATA_FILE}")
-
-    df = pd.read_excel(DATA_FILE, engine="openpyxl")
+def normalize_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str]]:
     raw_cols = list(df.columns)
-
-    df.columns = [_norm_col(c) for c in raw_cols]
-
-    # alias rename
-    rename_map = {}
-    for c in df.columns:
-        if c in ALIASES:
-            rename_map[c] = ALIASES[c]
-    df = df.rename(columns=rename_map)
-
-    # ensure columns exist
+    mapping = {}
+    for c in raw_cols:
+        key = _slug(str(c))
+        mapping[c] = ALIASES.get(key, key)
+    df = df.rename(columns=mapping)
+    normalized_cols = list(df.columns)
     for col in CANON_COLS:
         if col not in df.columns:
             df[col] = pd.NA
+    return df, raw_cols, normalized_cols
 
-    # types
-    df["plant_id"] = pd.to_numeric(df["plant_id"], errors="coerce").astype("Int64")
-    for dcol in ["last_watered", "next_due", "last_repot"]:
-        df[dcol] = pd.to_datetime(df[dcol], errors="coerce").dt.date
-    for ncol in ["water_interval_days", "suggested_interval_days", "repot_priority"]:
-        df[ncol] = pd.to_numeric(df[ncol], errors="coerce").astype("Int64")
 
-    df = ensure_next_due(df)
+def _to_date(x) -> Optional[date]:
+    if pd.isna(x) or x is None or x == "":
+        return None
+    if isinstance(x, date) and not isinstance(x, datetime):
+        return x
+    if isinstance(x, datetime):
+        return x.date()
+    try:
+        return pd.to_datetime(x).date()
+    except Exception:
+        return None
 
-    if df["plant_id"].notna().any():
-        df = df.sort_values("plant_id")
 
-    return df
+def _to_int(x) -> Optional[int]:
+    if pd.isna(x) or x is None or x == "":
+        return None
+    try:
+        return int(float(x))
+    except Exception:
+        return None
 
-def save_df(df: pd.DataFrame) -> None:
+
+def compute_next_due_row(row: pd.Series) -> Optional[date]:
+    lw = _to_date(row.get("last_watered"))
+    interval = _to_int(row.get("water_interval_days"))
+    if lw and interval and interval > 0:
+        return lw + timedelta(days=interval)
+    return None
+
+
+def load_plants() -> Tuple[pd.DataFrame, List[str], List[str]]:
+    with _file_lock:
+        df = pd.read_excel(PLANTS_FILE)
+
+    df, raw_cols, norm_cols = normalize_columns(df)
+
+    df["plant_id"] = df["plant_id"].apply(_to_int)
+    df["last_watered"] = df["last_watered"].apply(_to_date)
+    df["next_due"] = df["next_due"].apply(_to_date)
+    df["water_interval_days"] = df["water_interval_days"].apply(_to_int)
+
+    # автоген next_due если пусто
+    missing = df["next_due"].isna()
+    if missing.any():
+        df.loc[missing, "next_due"] = df.loc[missing].apply(compute_next_due_row, axis=1)
+
+    return df, raw_cols, norm_cols
+
+
+def save_plants(df: pd.DataFrame) -> None:
     out = df.copy()
-    for dcol in ["last_watered", "next_due", "last_repot"]:
-        out[dcol] = pd.to_datetime(out[dcol], errors="coerce")
-    out = out[CANON_COLS]
-    out.to_excel(DATA_FILE, index=False, engine="openpyxl")
+    for c in CANON_COLS:
+        if c not in out.columns:
+            out[c] = pd.NA
+    if "plant_id" in out.columns:
+        out = out.sort_values(by="plant_id", kind="stable")
+    with _file_lock:
+        out.to_excel(PLANTS_FILE, index=False)
 
-def due_today(df: pd.DataFrame) -> pd.DataFrame:
-    today = _today()
-    df = ensure_next_due(df)
-    return df[df["next_due"].notna() & (df["next_due"] <= today)].copy()
 
-def label(row: pd.Series) -> str:
-    nm = str(row.get("name") or "").strip()
-    loc = str(row.get("location") or "").strip()
-    return f"{nm} ({loc})" if loc else nm
-
-def build_keyboard(df_names: pd.DataFrame, selected: List[int]) -> InlineKeyboardMarkup:
-    rows = []
-    for _, r in df_names.iterrows():
-        if pd.isna(r["plant_id"]):
+def list_plants(df: pd.DataFrame) -> List[Tuple[int, str]]:
+    items = []
+    for _, r in df.iterrows():
+        pid = _to_int(r.get("plant_id"))
+        name = str(r.get("name") or "").strip()
+        if pid is None:
             continue
-        pid = int(r["plant_id"])
-        checked = "✅ " if pid in selected else ""
-        rows.append([InlineKeyboardButton(f"{checked}{r['name']}", callback_data=f"{CB_TOGGLE}{pid}")])
-    rows.append([
-        InlineKeyboardButton("Готово", callback_data=CB_DONE),
-        InlineKeyboardButton("Отмена", callback_data=CB_CANCEL),
-    ])
+        if not name:
+            name = f"Растение #{pid}"
+        items.append((pid, name))
+    return items
+
+
+def build_multiselect_keyboard(plants: List[Tuple[int, str]], selected: set) -> InlineKeyboardMarkup:
+    rows = []
+    for pid, name in plants:
+        mark = "✅ " if pid in selected else ""
+        rows.append([InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"toggle:{pid}")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="Готово", callback_data="done"),
+            InlineKeyboardButton(text="Отмена", callback_data="cancel"),
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
-# -------- Handlers (RU) --------
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = (
-        "🌿 *Привет! Я PlantBuddy.*\n\n"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🌿 Привет! Я PlantBuddy.\n"
+        "Я помогаю помнить уход за растениями.\n\n"
         "Команды:\n"
-        "• /status — что нужно полить сегодня\n"
-        "• /water — отметить полив (можно выбрать несколько)\n"
-        "• /debug — диагностика\n"
+        "/status — что нужно полить сегодня\n"
+        "/water — отметить полив (можно выбрать несколько)\n"
+        "/debug — диагностика"
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text)
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    df = load_df()
-    due = due_today(df)
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    df, _, _ = load_plants()
+    today = date.today()
+    due = df[df["next_due"].notna() & (df["next_due"] <= today)].copy()
 
     if due.empty:
-        await update.message.reply_text("✅ Сегодня по графику поливать ничего не нужно.")
+        await update.message.reply_text("Сегодня ничего поливать не нужно ✅")
         return
 
-    lines = ["💧 *Сегодня стоит полить:*"]
+    lines = ["Сегодня нужно полить:"]
     for _, r in due.iterrows():
-        nd = r["next_due"]
-        nds = nd.isoformat() if isinstance(nd, date) else "—"
-        lines.append(f"• {label(r)} — до {nds}")
+        name = r.get("name") or "Без названия"
+        loc = r.get("location") or ""
+        nd = r.get("next_due")
+        nd_s = nd.isoformat() if isinstance(nd, date) else str(nd)
+        lines.append(f"• {name}" + (f" ({loc})" if loc else "") + f" — срок {nd_s}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n".join(lines))
 
-async def water_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    df = load_df()
-    context.user_data["water_df_cache"] = df[["plant_id", "name"]].copy()
-    context.user_data["water_selected"] = []
-    kb = build_keyboard(context.user_data["water_df_cache"], [])
-    await update.message.reply_text("Что ты сегодня полила? Выбери растения (можно несколько) 👇", reply_markup=kb)
 
-async def cb_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    await q.answer()
-    pid = int((q.data or "").split(":", 1)[1])
+async def water(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    df, _, _ = load_plants()
+    plants = list_plants(df)
 
-    selected: List[int] = context.user_data.get("water_selected", [])
-    if pid in selected:
-        selected.remove(pid)
-    else:
-        selected.append(pid)
+    selected = context.user_data.get("water_selected", set())
+    if not isinstance(selected, set):
+        selected = set()
     context.user_data["water_selected"] = selected
 
-    df_cache = context.user_data.get("water_df_cache")
-    if df_cache is None:
-        df_cache = load_df()[["plant_id", "name"]].copy()
-        context.user_data["water_df_cache"] = df_cache
+    kb = build_multiselect_keyboard(plants, selected)
+    await update.message.reply_text("Что ты полила? Можно выбрать несколько 👇", reply_markup=kb)
 
-    await q.edit_message_reply_markup(reply_markup=build_keyboard(df_cache, selected))
 
-async def cb_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    await q.answer()
+async def water_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
 
-    selected: List[int] = context.user_data.get("water_selected", [])
-    if not selected:
-        await q.edit_message_text("Ок, ничего не отметили. Если нужно — /water ещё раз.")
-        context.user_data.pop("water_selected", None)
-        context.user_data.pop("water_df_cache", None)
+    df, _, _ = load_plants()
+    plants = list_plants(df)
+
+    selected = context.user_data.get("water_selected", set())
+    if not isinstance(selected, set):
+        selected = set()
+
+    if data.startswith("toggle:"):
+        pid = int(data.split(":", 1)[1])
+        if pid in selected:
+            selected.remove(pid)
+        else:
+            selected.add(pid)
+        context.user_data["water_selected"] = selected
+        await query.edit_message_reply_markup(reply_markup=build_multiselect_keyboard(plants, selected))
         return
 
-    df = load_df()
-    today = _today()
+    if data == "cancel":
+        context.user_data["water_selected"] = set()
+        await query.edit_message_text("Ок, отменено.")
+        return
 
-    updated_names = []
-    for pid in selected:
-        mask = df["plant_id"].astype("Int64") == pid
-        if not mask.any():
-            continue
+    if data == "done":
+        if not selected:
+            await query.edit_message_text("Ты ничего не выбрала — ок 🙂")
+            return
 
-        df.loc[mask, "last_watered"] = today
-        wi = df.loc[mask, "water_interval_days"].iloc[0]
-        if pd.notna(wi):
-            df.loc[mask, "next_due"] = today + timedelta(days=int(wi))
-        else:
-            df.loc[mask, "next_due"] = pd.NA
+        today = date.today()
+        df.loc[df["plant_id"].isin(list(selected)), "last_watered"] = today
+        df.loc[df["plant_id"].isin(list(selected)), "next_due"] = df.loc[
+            df["plant_id"].isin(list(selected))
+        ].apply(compute_next_due_row, axis=1)
 
-        updated_names.append(str(df.loc[mask, "name"].iloc[0]))
+        save_plants(df)
 
-    df = ensure_next_due(df)
-    save_df(df)
+        by_id = {pid: name for pid, name in plants}
+        names = [by_id.get(pid, f"#{pid}") for pid in sorted(selected)]
 
-    names_txt = ", ".join(updated_names) if updated_names else f"{len(selected)} шт."
-    await q.edit_message_text(
-        f"✅ Отметила полив: *{names_txt}*\nДата: {today.isoformat()}",
-        parse_mode=ParseMode.MARKDOWN
-    )
+        context.user_data["water_selected"] = set()
+        await query.edit_message_text("Записала полив на сегодня ✅\n" + "\n".join(f"• {n}" for n in names))
+        return
 
-    context.user_data.pop("water_selected", None)
-    context.user_data.pop("water_df_cache", None)
 
-async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    await q.answer()
-    await q.edit_message_text("Ок, отменили. Если нужно — /water ещё раз.")
-    context.user_data.pop("water_selected", None)
-    context.user_data.pop("water_df_cache", None)
-
-async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    df, raw_cols, norm_cols = load_plants()
+    sample = df[["plant_id", "name", "last_watered", "water_interval_days", "next_due"]].head(5)
     info = {
         "python": sys.version.split()[0],
         "platform": sys.platform,
-        "file": DATA_FILE,
+        "file": PLANTS_FILE,
         "cwd": os.getcwd(),
         "has TELEGRAM_TOKEN": bool(os.getenv("TELEGRAM_TOKEN")),
-        "has BASE_URL": bool(os.getenv("BASE_URL")),
-        "PORT": os.getenv("PORT", ""),
+        "has BASE_URL/RENDER_EXTERNAL_URL": bool(BASE_URL),
+        "raw columns": raw_cols,
+        "normalized columns": norm_cols,
+        "sample": sample.to_dict(orient="records"),
     }
+    await update.message.reply_text(
+        "```json\n" + json.dumps(info, ensure_ascii=False, indent=2) + "\n```",
+        parse_mode="Markdown",
+    )
+
+
+flask_app = Flask(__name__)
+_app: Optional[Application] = None
+_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+@flask_app.get(HEALTH_PATH)
+def health():
+    return "ok", 200
+
+
+@flask_app.post(WEBHOOK_PATH)
+def webhook():
+    global _app, _loop
+    if _app is None or _loop is None:
+        return "not ready", 503
+    update_json = request.get_json(force=True, silent=True) or {}
+    update = Update.de_json(update_json, _app.bot)
+    fut = asyncio.run_coroutine_threadsafe(_app.process_update(update), _loop)
     try:
-        raw_df = pd.read_excel(DATA_FILE, engine="openpyxl")
-        raw_cols = list(raw_df.columns)
-        df = load_df()
-        norm_cols = list(df.columns)
-        sample = df[["plant_id", "name", "last_watered", "water_interval_days", "next_due"]].head(5).to_string(index=False)
-    except Exception as e:
-        raw_cols = []
-        norm_cols = []
-        sample = f"ERROR: {e!r}"
+        fut.result(timeout=0.5)
+    except Exception:
+        pass
+    return "ok", 200
 
-    text = (
-        f"python: {info['python']}\n"
-        f"platform: {info['platform']}\n"
-        f"file: {info['file']}\n"
-        f"cwd: {info['cwd']}\n"
-        f"has TELEGRAM_TOKEN: {info['has TELEGRAM_TOKEN']}\n"
-        f"has BASE_URL: {info['has BASE_URL']}\n"
-        f"PORT: {info['PORT']}\n"
-        f"raw columns: {raw_cols}\n"
-        f"normalized columns: {norm_cols}\n"
-        f"sample:\n{sample}\n"
-    )
-    await update.message.reply_text(f"```text\n{text}\n```", parse_mode=ParseMode.MARKDOWN)
 
-# -------- Bootstrap (webhook) --------
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
 
-def build_app() -> Application:
-    token = os.getenv("TELEGRAM_TOKEN", "").strip()
+
+async def async_init_app(app: Application):
+    await app.initialize()
+    await app.start()
+
+    if not BASE_URL:
+        raise RuntimeError(
+            "BASE_URL missing. Добавь BASE_URL в Render (например https://plantbuddy-bot.onrender.com) "
+            "или используй RENDER_EXTERNAL_URL."
+        )
+
+    url = BASE_URL.rstrip("/") + WEBHOOK_PATH
+    await app.bot.set_webhook(url=url)
+    log.info("Webhook set to %s", url)
+
+
+def main():
+    global _app, _loop
+
+    token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_TOKEN is missing")
 
-    app = ApplicationBuilder().token(token).build()
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("water", water_cmd))
-    app.add_handler(CommandHandler("debug", debug_cmd))
+    _app = Application.builder().token(token).build()
+    _app.add_handler(CommandHandler("start", start))
+    _app.add_handler(CommandHandler("status", status))
+    _app.add_handler(CommandHandler("water", water))
+    _app.add_handler(CommandHandler("debug", debug))
+    _app.add_handler(CallbackQueryHandler(water_callback))
 
-    app.add_handler(CallbackQueryHandler(cb_toggle, pattern=f"^{re.escape(CB_TOGGLE)}"))
-    app.add_handler(CallbackQueryHandler(cb_done, pattern=f"^{re.escape(CB_DONE)}$"))
-    app.add_handler(CallbackQueryHandler(cb_cancel, pattern=f"^{re.escape(CB_CANCEL)}$"))
+    threading.Thread(target=run_flask, daemon=True).start()
+    log.info("Flask listening on 0.0.0.0:%s", os.getenv("PORT", "10000"))
 
-    return app
+    _loop.run_until_complete(async_init_app(_app))
+    log.info("PlantBuddy started (webhook mode).")
 
-def main() -> None:
-    token = os.getenv("TELEGRAM_TOKEN", "").strip()
-    base_url = os.getenv("BASE_URL", "").strip().rstrip("/")
-    if not token:
-        raise RuntimeError("TELEGRAM_TOKEN is missing")
-    if not base_url:
-        raise RuntimeError("BASE_URL is missing (e.g., https://plantbuddy-bot.onrender.com)")
+    _loop.run_forever()
 
-    port = int(os.getenv("PORT", "10000"))
-    listen = "0.0.0.0"
-
-    app = build_app()
-
-    # Keep a stable, non-guessable path
-    webhook_path = f"telegram/{token[:10]}"
-    webhook_url = f"{base_url}/{webhook_path}"
-
-    log.info("Starting webhook on %s:%s", listen, port)
-    log.info("Webhook URL: %s", webhook_url)
-
-    app.run_webhook(
-        listen=listen,
-        port=port,
-        url_path=webhook_path,
-        webhook_url=webhook_url,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
 
 if __name__ == "__main__":
     main()
